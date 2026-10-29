@@ -1,7 +1,9 @@
 /**
  * Shared seed logic for Verdant Organic Market.
  *
- * Idempotent: uses upserts keyed on slug/email/id so it can be re-run safely.
+ * Idempotent AND non-destructive: rows are only created when missing. Re-running
+ * the seed never overwrites an existing admin password or role, and never resets
+ * product prices, stock levels, descriptions or images on a live store.
  * Seeds: store settings, script settings, an admin user, 6 categories,
  * 24 organic products with images, and a few sample coupons.
  *
@@ -100,12 +102,22 @@ export async function runSeed(prisma: PrismaClient): Promise<SeedResult> {
   await prisma.scriptSettings.upsert({ where: { id: "default" }, update: {}, create: { id: "default" } });
 
   // --- Admin user ---
-  const adminEmail = (process.env.ADMIN_EMAIL || "admin@verdantmarket.com").toLowerCase();
-  const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe123!";
-  const passwordHash = await bcrypt.hash(adminPassword, 10);
+  // Credentials MUST come from the environment. There is deliberately no
+  // built-in fallback email/password: this repository is public.
+  const rawAdminEmail = process.env.ADMIN_EMAIL?.trim();
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (!rawAdminEmail || !adminPassword) {
+    throw new Error("ADMIN_EMAIL and ADMIN_PASSWORD must be set before seeding.");
+  }
+  if (adminPassword.length < 12) {
+    throw new Error("ADMIN_PASSWORD must be at least 12 characters long.");
+  }
+  const adminEmail = rawAdminEmail.toLowerCase();
+  const passwordHash = await bcrypt.hash(adminPassword, 12);
+  // `update: {}` — never reset the password or role of an account that already exists.
   await prisma.user.upsert({
     where: { email: adminEmail },
-    update: { role: Role.ADMIN, passwordHash },
+    update: {},
     create: { email: adminEmail, name: process.env.ADMIN_NAME || "Store Admin", role: Role.ADMIN, passwordHash },
   });
 
@@ -114,34 +126,24 @@ export async function runSeed(prisma: PrismaClient): Promise<SeedResult> {
   for (const cat of CATEGORIES) {
     const row = await prisma.category.upsert({
       where: { slug: cat.slug },
-      update: { name: cat.name, description: cat.description, imageUrl: cat.imageUrl, sortOrder: cat.sortOrder },
+      update: {},
       create: cat,
     });
     categoryIdBySlug.set(cat.slug, row.id);
   }
 
   // --- Products ---
+  // Only create products that do not exist yet. Existing products (including
+  // their live price, stock and images) are left exactly as they are.
   for (const [i, p] of PRODUCTS.entries()) {
     const categoryId = categoryIdBySlug.get(p.category)!;
+    const existing = await prisma.product.findUnique({ where: { slug: p.slug }, select: { id: true } });
+    if (existing) continue;
+
     // Sequential, guaranteed-unique SKU (e.g. VRD-0001).
     const sku = `VRD-${String(i + 1).padStart(4, "0")}`;
-    const product = await prisma.product.upsert({
-      where: { slug: p.slug },
-      update: {
-        name: p.name,
-        description: p.description,
-        shortDesc: p.shortDesc,
-        priceCents: c(p.price),
-        compareAtCents: p.compareAt ? c(p.compareAt) : null,
-        stock: p.stock,
-        unit: p.unit,
-        certification: p.certification,
-        tags: p.tags,
-        isFeatured: !!p.featured,
-        isBestSeller: !!p.bestSeller,
-        categoryId,
-      },
-      create: {
+    const product = await prisma.product.create({
+      data: {
         name: p.name,
         slug: p.slug,
         description: p.description,
@@ -161,8 +163,6 @@ export async function runSeed(prisma: PrismaClient): Promise<SeedResult> {
         categoryId,
       },
     });
-
-    await prisma.productImage.deleteMany({ where: { productId: product.id } });
     await prisma.productImage.create({ data: { productId: product.id, url: p.image, alt: p.name, sortOrder: 0 } });
   }
 

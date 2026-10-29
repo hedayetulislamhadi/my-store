@@ -4,17 +4,30 @@ import { prisma } from "@/lib/prisma";
 import { runSeed } from "@/lib/seed";
 import { SCHEMA_SQL } from "@/lib/schema-sql";
 
-// SHA-256 of a one-time setup key. Only the hash is committed (safe for a public
-// repo — the key itself is preimage-resistant), so the database can be
-// bootstrapped without depending on NEXTAUTH_SECRET being configured yet.
-const SETUP_KEY_HASH = "1e62f83ddfd528bf0317bb6d4a0fca6937bbbd189c8c12646e393ac3cca779b5";
+// The setup endpoint is DISABLED unless SETUP_SECRET is set in the environment
+// (min. 24 chars). Remove SETUP_SECRET (or delete this route) once the database
+// has been bootstrapped. The secret is only accepted in a request header — never
+// in the URL, where it would end up in logs, browser history and referrers — and
+// no secret or secret hash is stored in the repository.
+const MIN_SECRET_LENGTH = 24;
 
-function isAuthorized(key: string | null): boolean {
+function setupSecret(): string | null {
+  const secret = process.env.SETUP_SECRET;
+  return secret && secret.length >= MIN_SECRET_LENGTH ? secret : null;
+}
+
+function readKey(req: Request): string | null {
+  const bearer = req.headers.get("authorization");
+  if (bearer && bearer.toLowerCase().startsWith("bearer ")) return bearer.slice(7).trim();
+  return req.headers.get("x-setup-key");
+}
+
+function isAuthorized(key: string | null, secret: string): boolean {
   if (!key) return false;
-  const envSecret = process.env.SETUP_SECRET || process.env.NEXTAUTH_SECRET;
-  if (envSecret && key === envSecret) return true;
-  const hash = crypto.createHash("sha256").update(key).digest("hex");
-  return hash === SETUP_KEY_HASH;
+  // Compare fixed-length digests in constant time.
+  const a = crypto.createHash("sha256").update(key).digest();
+  const b = crypto.createHash("sha256").update(secret).digest();
+  return crypto.timingSafeEqual(a, b);
 }
 
 // Guarded, idempotent database bootstrap endpoint. Creates the schema (tables,
@@ -22,8 +35,9 @@ function isAuthorized(key: string | null): boolean {
 // request — needed because the database is only reachable from inside the
 // deployment environment, not from the build sandbox.
 //
-// Auth: pass ?key=<secret> matching SETUP_SECRET (falls back to NEXTAUTH_SECRET).
+// Auth: POST with header `Authorization: Bearer <SETUP_SECRET>` (or `x-setup-key`).
 // Only requires DATABASE_URL — no migrations CLI or direct connection needed.
+// Seeding is non-destructive: existing admin, products, stock and images are kept.
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -77,8 +91,12 @@ function envStatus() {
 }
 
 async function handle(req: Request) {
-  const key = new URL(req.url).searchParams.get("key");
-  if (!isAuthorized(key)) {
+  const secret = setupSecret();
+  if (!secret) {
+    // Endpoint is switched off — behave as if it does not exist.
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  if (!isAuthorized(readKey(req), secret)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -95,5 +113,4 @@ async function handle(req: Request) {
   }
 }
 
-export const GET = handle;
 export const POST = handle;
